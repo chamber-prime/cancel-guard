@@ -9,6 +9,9 @@ on:
       stage_seconds:
         description: seconds per stage (5 stages)
         default: "60"
+      tf_dir:
+        description: "path to the probe's main.tf (leave blank to auto-locate)"
+        default: ""
 
 permissions:
   contents: read
@@ -17,24 +20,59 @@ jobs:
   probe:
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    defaults:
-      run:
-        working-directory: repro/step1-cancel-probe
     steps:
       - uses: actions/checkout@v4
+
+      # ---------------------------------------------------------------------
+      # Find main.tf rather than assuming where it lives. A hardcoded
+      # working-directory fails before any of the interesting behaviour starts,
+      # and the error ("No such file or directory") points at bash instead of at
+      # the real cause, which is the repo layout.
+      # ---------------------------------------------------------------------
+      - name: Locate the probe
+        id: locate
+        run: |
+          echo "repo root contents:"
+          ls -la
+          echo
+          echo "every main.tf in the repo:"
+          find . -name main.tf -not -path './.git/*' || true
+          echo
+
+          DIR="${{ inputs.tf_dir }}"
+          if [ -z "$DIR" ]; then
+            DIR=$(dirname "$(find . -name main.tf -not -path './.git/*' -path '*probe*' | head -1)")
+            if [ ! -f "$DIR/main.tf" ]; then
+              DIR=$(dirname "$(grep -rl 'stage_seconds' --include=main.tf . | head -1)")
+            fi
+            if [ ! -f "$DIR/main.tf" ]; then
+              DIR=$(dirname "$(find . -name main.tf -not -path './.git/*' | head -1)")
+            fi
+          fi
+
+          if [ ! -f "$DIR/main.tf" ]; then
+            echo "::error::could not find the probe's main.tf. Commit it, or pass tf_dir when dispatching."
+            exit 1
+          fi
+
+          echo "using: $DIR"
+          echo "dir=$DIR" >> "$GITHUB_OUTPUT"
 
       - uses: hashicorp/setup-terraform@v3
         with:
           terraform_wrapper: false      # the wrapper intercepts signals; we want raw terraform
 
       - name: Mark start
+        working-directory: ${{ steps.locate.outputs.dir }}
         run: echo "JOB START $(date -uIseconds)"
 
       - name: Init
+        working-directory: ${{ steps.locate.outputs.dir }}
         run: terraform init -no-color
 
       # The step under observation. Watch the heartbeats, then press Cancel.
       - name: Apply
+        working-directory: ${{ steps.locate.outputs.dir }}
         run: |
           echo "APPLY INVOKED $(date -uIseconds)  pid=$$"
           terraform apply -auto-approve -no-color \
@@ -42,14 +80,14 @@ jobs:
 
       # --- the measurements -------------------------------------------------
       # Compare these timestamps against the last heartbeat in the Apply step.
-      # The gap is your real grace period, which is the number that decides
-      # whether a graceful-shutdown wrapper can do anything useful at all.
+      # The gap is your real grace period, and it decides whether a graceful
+      # shutdown wrapper can do anything useful at all.
 
       - name: Ran because CANCELLED
         if: cancelled()
         run: |
           echo "CANCELLED-BRANCH REACHED $(date -uIseconds)"
-          echo "How long did this get before the runner pulled the plug?"
+          echo "How long does this get before the runner pulls the plug?"
           for i in $(seq 1 30); do
             echo "[$(date -uIseconds)] post-cancel step still alive, ${i}s"
             sleep 1
