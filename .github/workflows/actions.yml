@@ -1,0 +1,65 @@
+name: cancel-probe
+
+# Run it, let it get a minute or two in, then hit Cancel and read the log.
+# Everything here is local -- no cloud credentials needed.
+
+on:
+  workflow_dispatch:
+    inputs:
+      stage_seconds:
+        description: seconds per stage (5 stages)
+        default: "60"
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: repro/step1-cancel-probe
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false      # the wrapper intercepts signals; we want raw terraform
+
+      - name: Mark start
+        run: echo "JOB START $(date -uIseconds)"
+
+      - name: Init
+        run: terraform init -no-color
+
+      # The step under observation. Watch the heartbeats, then press Cancel.
+      - name: Apply
+        run: |
+          echo "APPLY INVOKED $(date -uIseconds)  pid=$$"
+          terraform apply -auto-approve -no-color \
+            -var stage_seconds=${{ inputs.stage_seconds || '60' }}
+
+      # --- the measurements -------------------------------------------------
+      # Compare these timestamps against the last heartbeat in the Apply step.
+      # The gap is your real grace period, which is the number that decides
+      # whether a graceful-shutdown wrapper can do anything useful at all.
+
+      - name: Ran because CANCELLED
+        if: cancelled()
+        run: |
+          echo "CANCELLED-BRANCH REACHED $(date -uIseconds)"
+          echo "How long did this get before the runner pulled the plug?"
+          for i in $(seq 1 30); do
+            echo "[$(date -uIseconds)] post-cancel step still alive, ${i}s"
+            sleep 1
+          done
+          echo "POST-CANCEL STEP COMPLETED 30s $(date -uIseconds)"
+
+      - name: Ran because FAILED
+        if: failure()
+        run: echo "FAILURE-BRANCH REACHED $(date -uIseconds)"
+
+      - name: Always runs
+        if: always()
+        run: echo "ALWAYS-BRANCH REACHED $(date -uIseconds) status=${{ job.status }}"
