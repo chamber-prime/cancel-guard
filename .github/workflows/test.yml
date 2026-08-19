@@ -9,5 +9,6 @@ jobs:
     steps:
       - run: |
           echo "Hello World!"
-          ls -la ./main.tf
+          ls -la
+          pwd
           
