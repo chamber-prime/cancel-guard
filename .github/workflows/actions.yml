@@ -1,7 +1,9 @@
 name: cancel-probe
 
 # Run it, let it get a minute or two in, then hit Cancel and read the log.
-# Everything here is local -- no cloud credentials needed.
+# State now lives remotely (Azure Blob, OIDC auth, see the backend block in
+# main.tf), so the Plan step below exercises real state locking, not just
+# local resources.
 
 on:
   workflow_dispatch:
@@ -12,6 +14,13 @@ on:
 
 permissions:
   contents: read
+  id-token: write   # required for the OIDC federated credential exchange
+
+env:
+  ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+  ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+  ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+  ARM_USE_OIDC: true
 
 jobs:
   build:
@@ -31,6 +40,17 @@ jobs:
       - name: Init
         working-directory: ${{ steps.locate.outputs.dir }}
         run: terraform init -no-color
+
+      # Acquires the remote state lock, reads current state, computes a diff,
+      # releases the lock. This is the stage that exercises locking -- if you
+      # cancel here (rather than during Apply), check the storage account for
+      # a leftover lease / .tflock blob afterwards.
+      - name: Plan
+        working-directory: ${{ steps.locate.outputs.dir }}
+        run: |
+          echo "PLAN INVOKED $(date -uIseconds)  pid=$$"
+          terraform plan -no-color -input=false \
+            -var stage_seconds=${{ inputs.stage_seconds || '60' }}
 
       # The step under observation. Watch the heartbeats, then press Cancel.
       - name: Apply
