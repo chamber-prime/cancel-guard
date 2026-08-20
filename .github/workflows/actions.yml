@@ -26,11 +26,14 @@ env:
   TFSTATE_ACCOUNT: ${{ vars.TFSTATE_STORAGE_ACCOUNT }}
   TFSTATE_CONTAINER: tfstate
   TFSTATE_KEY: cancel-guard.tfstate
+  TF_STATUS: "NOT STARTED"
 
 jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    outputs:
+      tf_status: ${{ steps.export_status.outputs.tf_status }}
     steps:
       - uses: actions/checkout@v4
 
@@ -57,6 +60,9 @@ jobs:
           terraform plan -no-color -input=false \
             -var stage_seconds=${{ inputs.stage_seconds || '60' }}
 
+      - name: Mark status RUNNING
+        run: echo "TF_STATUS=RUNNING" >> "$GITHUB_ENV"
+
       # The step under observation. Watch the heartbeats, then press Cancel.
       - name: Apply
         working-directory: ${{ steps.locate.outputs.dir }}
@@ -64,6 +70,22 @@ jobs:
           echo "APPLY INVOKED $(date -uIseconds)  pid=$$"
           terraform apply -auto-approve -no-color \
             -var stage_seconds=${{ inputs.stage_seconds || '60' }}
+
+      - name: Mark status SUCCESS
+        if: success()
+        run: echo "TF_STATUS=SUCCESS" >> "$GITHUB_ENV"
+
+      - name: Mark status FAILED
+        if: failure()
+        run: echo "TF_STATUS=FAILED" >> "$GITHUB_ENV"
+
+      - name: Mark status CANCELLED
+        if: cancelled()
+        run: echo "TF_STATUS=CANCELLED" >> "$GITHUB_ENV"
+
+      - name: Deploy
+        working-directory: ${{ steps.locate.outputs.dir }}
+        run: sleep 30
 
       # --- the measurements -------------------------------------------------
       # Compare these timestamps against the last heartbeat in the Apply step.
@@ -81,12 +103,37 @@ jobs:
           done
           echo "POST-CANCEL STEP COMPLETED 30s $(date -uIseconds)"
 
-      # A killed terraform process never releases the state lock -- it holds
-      # an infinite blob lease that only a live process would break itself.
-      # Without this, every future run fails with "Error acquiring the state
-      # lock" until someone breaks it by hand.
-      - name: Azure login (cancelled)
-        if: cancelled()
+      # Rollback itself now happens in dedicated jobs below (rollback-auto /
+      # rollback-gate), keyed off tf_status so a SUCCESSFUL apply followed by
+      # a later cancel/failure (e.g. in Deploy) goes through manual approval
+      # instead of being auto-rolled-back.
+
+      - name: Ran because FAILED
+        if: failure()
+        run: echo "FAILURE-BRANCH REACHED $(date -uIseconds)"
+
+      - name: Always runs
+        if: always()
+        run: echo "ALWAYS-BRANCH REACHED $(date -uIseconds) status=${{ job.status }}"
+
+      - name: Export status
+        if: always()
+        id: export_status
+        run: echo "tf_status=$TF_STATUS" >> "$GITHUB_OUTPUT"
+
+  # Apply itself was interrupted (state never reached SUCCESS) -- no
+  # ambiguity about whether the new resources are wanted, so roll back
+  # automatically. Also covers TF_STATUS=FAILED regardless of which step
+  # failed.
+  rollback-auto:
+    needs: build
+    if: |
+      always() &&
+      (needs.build.outputs.tf_status == 'FAILED' ||
+       (needs.build.result == 'cancelled' && needs.build.outputs.tf_status != 'SUCCESS'))
+    runs-on: ubuntu-latest
+    steps:
+      - name: Azure login
         uses: azure/login@v2
         with:
           client-id: ${{ vars.AZURE_CLIENT_ID }}
@@ -94,7 +141,6 @@ jobs:
           subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
 
       - name: Break stale state lock
-        if: cancelled()
         run: |
           az storage blob lease break \
             --account-name "$TFSTATE_ACCOUNT" \
@@ -105,12 +151,11 @@ jobs:
           && echo "lease broken" \
           || echo "no lease held, nothing to break"
 
-      # A cancelled Apply can die mid-write, leaving a partially updated
-      # state blob. Blob versioning (enabled on the storage account in
-      # main.tf) keeps every prior write, so roll the live blob back to the
-      # version that existed before this run touched it.
+      # A cancelled/failed Apply can die mid-write, leaving a partially
+      # updated state blob. Blob versioning (enabled on the storage account
+      # in main.tf) keeps every prior write, so roll the live blob back to
+      # the version that existed before this run touched it.
       - name: Roll back state to previous version
-        if: cancelled()
         run: |
           set -u
 
@@ -142,10 +187,64 @@ jobs:
 
           echo "state rolled back to version $PREV_VERSION"
 
-      - name: Ran because FAILED
-        if: failure()
-        run: echo "FAILURE-BRANCH REACHED $(date -uIseconds)"
+  # Apply itself SUCCEEDED, but the run then failed or was cancelled later
+  # (e.g. in Deploy). The new state is legitimate, so don't roll it back
+  # automatically -- pause here for a human to decide. Configure required
+  # reviewers on the "rollback-approval" environment in repo Settings ->
+  # Environments to make this pause enforce an actual approval.
+  rollback-gate:
+    needs: build
+    if: |
+      always() &&
+      needs.build.outputs.tf_status == 'SUCCESS' &&
+      needs.build.result != 'success'
+    runs-on: ubuntu-latest
+    environment: rollback-approval
+    steps:
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Always runs
-        if: always()
-        run: echo "ALWAYS-BRANCH REACHED $(date -uIseconds) status=${{ job.status }}"
+      - name: Break stale state lock
+        run: |
+          az storage blob lease break \
+            --account-name "$TFSTATE_ACCOUNT" \
+            --container-name "$TFSTATE_CONTAINER" \
+            --blob-name "$TFSTATE_KEY" \
+            --auth-mode login \
+            --output none \
+          && echo "lease broken" \
+          || echo "no lease held, nothing to break"
+
+      - name: Roll back state to previous version
+        run: |
+          set -u
+
+          PREV_VERSION=$(az storage blob list \
+            --account-name "$TFSTATE_ACCOUNT" --container-name "$TFSTATE_CONTAINER" \
+            --prefix "$TFSTATE_KEY" --include v --auth-mode login \
+            --query "reverse(sort_by([?name=='$TFSTATE_KEY' && isCurrentVersion!=\`true\`], &versionId))[0].versionId" \
+            -o tsv)
+
+          if [ -z "$PREV_VERSION" ] || [ "$PREV_VERSION" = "None" ]; then
+            echo "No earlier version found -- nothing to roll back to."
+            exit 0
+          fi
+
+          echo "rolling back to version:  $PREV_VERSION"
+
+          TMP=$(mktemp)
+          az storage blob download \
+            --account-name "$TFSTATE_ACCOUNT" --container-name "$TFSTATE_CONTAINER" \
+            --name "$TFSTATE_KEY" --version-id "$PREV_VERSION" \
+            --auth-mode login --file "$TMP" --output none
+
+          az storage blob upload \
+            --account-name "$TFSTATE_ACCOUNT" --container-name "$TFSTATE_CONTAINER" \
+            --name "$TFSTATE_KEY" --file "$TMP" \
+            --auth-mode login --overwrite --output none
+
+          echo "state rolled back to version $PREV_VERSION"
