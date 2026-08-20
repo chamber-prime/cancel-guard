@@ -80,13 +80,13 @@ terraform {
   # storage_account_name comes from `terraform output storage_account_name`
   # -- see the bootstrap instructions above. Leave this block commented out
   # until that storage account exists.
-  # backend "azurerm" {
-  #   resource_group_name  = "rg-tfstate-cancel-guard"
-  #   storage_account_name = "REPLACE_WITH_BOOTSTRAP_OUTPUT"
-  #   container_name       = "tfstate"
-  #   key                  = "cancel-guard.tfstate"
-  #   use_azuread_auth     = true
-  # }
+  backend "azurerm" {
+    resource_group_name  = "rg-tfstate-cancel-guard"
+    storage_account_name = "stcgtfstatef0d9qy"
+    container_name       = "tfstate"
+    key                  = "cancel-guard.tfstate"
+    use_azuread_auth     = true
+  }
 }
 
 provider "azurerm" {
@@ -110,7 +110,7 @@ variable "github_oidc_subject" {
       repo:chamber-prime@<ownerId>/cancel-guard@<repoId>:ref:refs/heads/main
   EOT
   type        = string
-  default     = "repo:chamber-prime/cancel-guard:ref:refs/heads/main"
+  default     = "repo:chamber-prime@312469008/cancel-guard@1338427675:ref:refs/heads/main"
 }
 
 resource "random_string" "suffix" {
