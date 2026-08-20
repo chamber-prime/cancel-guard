@@ -99,7 +99,7 @@ jobs:
           az storage blob lease break \
             --account-name "$TFSTATE_ACCOUNT" \
             --container-name "$TFSTATE_CONTAINER" \
-            --name "$TFSTATE_KEY" \
+            --blob-name "$TFSTATE_KEY" \
             --auth-mode login \
             --output none \
           && echo "lease broken" \
