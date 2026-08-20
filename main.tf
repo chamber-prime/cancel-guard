@@ -90,6 +90,12 @@ terraform {
 }
 
 provider "azurerm" {
+  # Without this, the provider manages the storage container via account keys
+  # (listKeys) by default -- a much broader permission than the CI identity
+  # deliberately has. This routes those calls through AAD/RBAC instead, same
+  # as the backend's use_azuread_auth above.
+  storage_use_azuread = true
+
   features {}
 }
 
