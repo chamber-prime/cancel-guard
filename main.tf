@@ -176,11 +176,22 @@ resource "azurerm_federated_identity_credential" "github_main" {
   subject                   = var.github_oidc_subject
 }
 
-# Data plane only -- this identity's whole job is reading/writing/locking
-# the state blob from the terraform plan step. It creates no cloud resources.
+# Data plane -- reads/writes/locks the state blob during the plan step.
 resource "azurerm_role_assignment" "github_blob" {
   scope                = azurerm_storage_account.tfstate.id
   role_definition_name = "Storage Blob Data Contributor"
+  principal_id         = azurerm_user_assigned_identity.github.principal_id
+  principal_type       = "ServicePrincipal"
+}
+
+# Control plane, read-only -- the resource group, storage account, identity,
+# and role assignments above are all in this same state, so `terraform plan`
+# refreshes them on every run and needs read access. Deliberately Reader, not
+# Contributor: CI can see these resources but can't modify its own identity
+# or role assignments.
+resource "azurerm_role_assignment" "github_reader" {
+  scope                = azurerm_resource_group.tfstate.id
+  role_definition_name = "Reader"
   principal_id         = azurerm_user_assigned_identity.github.principal_id
   principal_type       = "ServicePrincipal"
 }
