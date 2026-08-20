@@ -106,6 +106,22 @@ variable "location" {
   default = "eastus2"
 }
 
+variable "bootstrap_operator_object_id" {
+  description = <<-EOT
+    Fixed object ID of the human bootstrap operator, used for
+    azurerm_role_assignment.me_blob below. Deliberately NOT
+    data.azurerm_client_config.current.object_id -- that data source
+    resolves to whoever is CURRENTLY running terraform, so it's your
+    object ID when you run it locally but the CI identity's object ID
+    when GitHub Actions runs it. Since principal_id forces replacement,
+    CI would then try to destroy this assignment and recreate it under
+    its own identity -- and fail, since CI is deliberately Reader-only
+    for RBAC (see azurerm_role_assignment.github_reader below).
+  EOT
+  type        = string
+  default     = "8e867a43-6397-4eab-b4ea-42c303667073"
+}
+
 variable "github_oidc_subject" {
   description = <<-EOT
     The exact subject claim GitHub presents. Standard form for a repo with
@@ -161,7 +177,7 @@ resource "azurerm_storage_container" "tfstate" {
 resource "azurerm_role_assignment" "me_blob" {
   scope                = azurerm_storage_account.tfstate.id
   role_definition_name = "Storage Blob Data Contributor"
-  principal_id         = data.azurerm_client_config.current.object_id
+  principal_id         = var.bootstrap_operator_object_id
 }
 
 ########################################
