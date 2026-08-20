@@ -21,6 +21,11 @@ env:
   ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
   ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
   ARM_USE_OIDC: true
+  # Same storage account/container/key as the backend block in main.tf --
+  # used below by the az CLI to break the stale lease and roll back state.
+  TFSTATE_ACCOUNT: ${{ vars.TFSTATE_STORAGE_ACCOUNT }}
+  TFSTATE_CONTAINER: tfstate
+  TFSTATE_KEY: cancel-guard.tfstate
 
 jobs:
   build:
@@ -75,6 +80,67 @@ jobs:
             sleep 1
           done
           echo "POST-CANCEL STEP COMPLETED 30s $(date -uIseconds)"
+
+      # A killed terraform process never releases the state lock -- it holds
+      # an infinite blob lease that only a live process would break itself.
+      # Without this, every future run fails with "Error acquiring the state
+      # lock" until someone breaks it by hand.
+      - name: Azure login (cancelled)
+        if: cancelled()
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Break stale state lock
+        if: cancelled()
+        run: |
+          az storage blob lease break \
+            --account-name "$TFSTATE_ACCOUNT" \
+            --container-name "$TFSTATE_CONTAINER" \
+            --name "$TFSTATE_KEY" \
+            --auth-mode login \
+            --output none \
+          && echo "lease broken" \
+          || echo "no lease held, nothing to break"
+
+      # A cancelled Apply can die mid-write, leaving a partially updated
+      # state blob. Blob versioning (enabled on the storage account in
+      # main.tf) keeps every prior write, so roll the live blob back to the
+      # version that existed before this run touched it.
+      - name: Roll back state to previous version
+        if: cancelled()
+        run: |
+          set -u
+
+          # Every past write is a version with isCurrentVersion=false; the
+          # live blob itself isn't in this list. Newest-first, take the top.
+          PREV_VERSION=$(az storage blob list \
+            --account-name "$TFSTATE_ACCOUNT" --container-name "$TFSTATE_CONTAINER" \
+            --prefix "$TFSTATE_KEY" --include v --auth-mode login \
+            --query "reverse(sort_by([?name=='$TFSTATE_KEY' && isCurrentVersion!=\`true\`], &versionId))[0].versionId" \
+            -o tsv)
+
+          if [ -z "$PREV_VERSION" ] || [ "$PREV_VERSION" = "None" ]; then
+            echo "No earlier version found -- nothing to roll back to."
+            exit 0
+          fi
+
+          echo "rolling back to version:  $PREV_VERSION"
+
+          TMP=$(mktemp)
+          az storage blob download \
+            --account-name "$TFSTATE_ACCOUNT" --container-name "$TFSTATE_CONTAINER" \
+            --name "$TFSTATE_KEY" --version-id "$PREV_VERSION" \
+            --auth-mode login --file "$TMP" --output none
+
+          az storage blob upload \
+            --account-name "$TFSTATE_ACCOUNT" --container-name "$TFSTATE_CONTAINER" \
+            --name "$TFSTATE_KEY" --file "$TMP" \
+            --auth-mode login --overwrite --output none
+
+          echo "state rolled back to version $PREV_VERSION"
 
       - name: Ran because FAILED
         if: failure()
