@@ -15,6 +15,7 @@ on:
 permissions:
   contents: read
   id-token: write   # required for the OIDC federated credential exchange
+  actions: read     # lets the stale-run check list past workflow runs
 
 env:
   ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
@@ -35,6 +36,64 @@ jobs:
     outputs:
       tf_status: ${{ steps.export_status.outputs.tf_status }}
     steps:
+      # Runs are workflow_dispatch and get re-triggered a lot while testing
+      # cancellation, so they don't always finish in commit order. If a
+      # newer commit already succeeded, flag it now -- before Apply even
+      # starts -- so a later failure on this (older) commit doesn't get
+      # misread as a regression.
+      - name: Check for a newer already-succeeded run
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -u
+
+          commit_epoch() {
+            local date_str
+            date_str=$(gh api "repos/${{ github.repository }}/commits/$1" --jq '.commit.committer.date' 2>/dev/null) || return 1
+            [ -z "$date_str" ] && return 1
+            date -d "$date_str" +%s
+          }
+
+          CURRENT_SHA="${{ github.sha }}"
+          CURRENT_EPOCH=$(commit_epoch "$CURRENT_SHA") || {
+            echo "Couldn't resolve this commit's date -- skipping the check."
+            exit 0
+          }
+
+          CANDIDATES=$(gh run list \
+            --workflow=actions.yml \
+            --branch "${{ github.ref_name }}" \
+            --status success \
+            --limit 10 \
+            --json headSha,databaseId,url \
+            --jq '.[] | @base64') || CANDIDATES=""
+
+          for row in $CANDIDATES; do
+            CAND_SHA=$(echo "$row" | base64 --decode | jq -r '.headSha')
+            [ "$CAND_SHA" = "$CURRENT_SHA" ] && continue
+
+            CAND_EPOCH=$(commit_epoch "$CAND_SHA") || continue
+            if [ "$CAND_EPOCH" -gt "$CURRENT_EPOCH" ]; then
+              CAND_ID=$(echo "$row" | base64 --decode | jq -r '.databaseId')
+              CAND_URL=$(echo "$row" | base64 --decode | jq -r '.url')
+
+              echo "::warning::Commit $CAND_SHA already succeeded (run $CAND_URL) and is newer than this run's commit $CURRENT_SHA. If this run fails, it may be a stale/out-of-order result, not a regression."
+
+              {
+                echo "### Possibly stale run"
+                echo "This run is building an older commit (\`$CURRENT_SHA\`)."
+                echo "A newer commit \`$CAND_SHA\` already succeeded in [run #$CAND_ID]($CAND_URL)."
+                echo ""
+                echo "If this run fails, check whether \`$CAND_SHA\` already fixes it before treating this as a regression."
+              } >> "$GITHUB_STEP_SUMMARY"
+
+              exit 0
+            fi
+          done
+
+          echo "No newer successful run found on this branch."
+
       - uses: actions/checkout@v4
 
       - uses: hashicorp/setup-terraform@v3
