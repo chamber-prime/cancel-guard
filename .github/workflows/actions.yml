@@ -62,6 +62,7 @@ jobs:
           }
 
           CANDIDATES=$(gh run list \
+            --repo "${{ github.repository }}" \
             --workflow=actions.yml \
             --branch "${{ github.ref_name }}" \
             --status success \
