@@ -12,6 +12,16 @@ on:
         description: seconds per stage (5 stages)
         default: "60"
 
+# Only one run per branch at a time. A second dispatch cancels whatever's
+# still running instead of racing it -- two live `terraform apply`s against
+# the same state would just fight over the lock. Cancelling (rather than
+# letting the new run fail outright) is deliberate: it drives the old run
+# through the cancelled() cleanup path below (rollback-auto breaks the lease
+# and rolls back state) instead of leaving it to die mid-apply unattended.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
   id-token: write   # required for the OIDC federated credential exchange
